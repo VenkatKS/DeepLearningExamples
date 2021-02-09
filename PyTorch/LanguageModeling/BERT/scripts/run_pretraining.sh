@@ -31,11 +31,12 @@ allreduce_post_accumulation=${14:-"true"}
 allreduce_post_accumulation_fp16=${15:-"true"}
 disable_weight_tie=${16:-"false"}
 DATASET=hdf5_lower_case_1_seq_len_128_max_pred_20_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5/cust_pubmed/
-DATA_DIR_PHASE1=${17:-$BERT_PREP_WORKING_DIR/${DATASET}/}
+init_checkpoint=${17:-"None"}
+master_port=${18:-9903}
 BERT_CONFIG=bert_config.json
 DATASET2=hdf5_lower_case_1_seq_len_512_max_pred_80_masked_lm_prob_0.15_random_seed_12345_dupe_factor_5_shard_1472_test_split_10/books_wiki_en_corpus/training # change this for other datasets
-CODEDIR=${18:-"/workspace/bert"}
-init_checkpoint=${19:-"None"}
+CODEDIR=${19:-"/workspace/bert"}
+DATA_DIR_PHASE1=${20:-$BERT_PREP_WORKING_DIR/${DATASET}/}
 RESULTS_DIR=$CODEDIR/results
 CHECKPOINTS_DIR=$RESULTS_DIR/checkpoints_${job_name}
 
@@ -77,6 +78,7 @@ fi
 
 CHECKPOINT=""
 if [ "$resume_training" == "true" ] ; then
+   echo "RESUME FROM CHECKPOINT"
    CHECKPOINT="--resume_from_checkpoint"
 fi
 
@@ -92,6 +94,7 @@ fi
 
 INIT_CHECKPOINT=""
 if [ "$init_checkpoint" != "None" ] ; then
+   echo "INIT CHECKPOINTS $init_checkpoint"
    INIT_CHECKPOINT="--init_checkpoint=$init_checkpoint"
 fi
 
@@ -127,11 +130,12 @@ if [ "$disable_weight_tie" == "false" ] ; then
 	CMD+=" --json-summary ${RESULTS_DIR}/dllogger.json "
 fi
 
-CMD="python3 -m torch.distributed.launch --nproc_per_node=$num_gpus $CMD"
+CMD="python3 -m torch.distributed.launch --nproc_per_node=$num_gpus --master_port=$master_port $CMD"
 
 
 if [ "$create_logfile" = "true" ] ; then
   export GBS=$(expr $train_batch_size \* $num_gpus)
+  echo "GLOBAL BATCH SIZE ${GBS}"
   printf -v TAG "pyt_bert_pretraining_phase1_%s_gbs%d" "$precision" $GBS
   DATESTAMP=`date +'%y%m%d%H%M%S'`
   LOGFILE=$RESULTS_DIR/$job_name.$TAG.$DATESTAMP.log

@@ -220,7 +220,7 @@ def parse_arguments():
                         type=float, default=0.0,
                         help='Loss scaling, positive power of 2 values can improve fp16 convergence.')
     parser.add_argument('--log_freq',
-                        type=float, default=1.0,
+                        type=float, default=100.0,
                         help='frequency of logging loss.')
     parser.add_argument('--checkpoint_activations',
                         default=False,
@@ -351,6 +351,12 @@ def prepare_model_and_optimizer(args, device):
     modeling.ACT2FN["bias_gelu"] = modeling.bias_gelu_training
     model = modeling.BertForPreTraining(config)
 
+    if args.disable_weight_tying:
+        print ("WARNING!!!!!!! Disabling weight tying for this run")
+        print ("BEFORE ", model.cls.predictions.decoder.weight is model.bert.embeddings.word_embeddings.weight)
+        model.cls.predictions.decoder.weight = torch.nn.Parameter(model.cls.predictions.decoder.weight.clone().detach())
+        print ("AFTER ", model.cls.predictions.decoder.weight is model.bert.embeddings.word_embeddings.weight)
+
     checkpoint = None
     if not args.resume_from_checkpoint:
         global_step = 0
@@ -366,7 +372,44 @@ def prepare_model_and_optimizer(args, device):
         else:
             checkpoint = torch.load(args.init_checkpoint, map_location="cpu")
 
-        model.load_state_dict(checkpoint['model'], strict=False)
+        import copy
+
+        checkpoint['model']['bert.embeddings.word_embeddings.weight'] = torch.cat((checkpoint['model']['bert.embeddings.word_embeddings.weight'], torch.zeros(6, 1024)), dim = 0)
+
+        checkpoint['model']['cls.predictions.decoder.weight'] = torch.cat((checkpoint['model']['cls.predictions.decoder.linear1.weight'], checkpoint['model']['cls.predictions.decoder.linear2.weight'], checkpoint['model']['cls.predictions.decoder.linear3.weight'], checkpoint['model']['cls.predictions.decoder.linear4.weight']), dim = 0)
+        del checkpoint['model']['cls.predictions.decoder.linear1.weight']
+        del checkpoint['model']['cls.predictions.decoder.linear2.weight']
+        del checkpoint['model']['cls.predictions.decoder.linear3.weight']
+        del checkpoint['model']['cls.predictions.decoder.linear4.weight']
+
+        checkpoint['model']['cls.predictions.bias'] = torch.cat((checkpoint['model']['cls.predictions.decoder.linear1.bias'], checkpoint['model']['cls.predictions.decoder.linear2.bias'], checkpoint['model']['cls.predictions.decoder.linear3.bias'], checkpoint['model']['cls.predictions.decoder.linear4.bias']), dim=0)
+        del checkpoint['model']['cls.predictions.decoder.linear1.bias']
+        del checkpoint['model']['cls.predictions.decoder.linear2.bias']
+        del checkpoint['model']['cls.predictions.decoder.linear3.bias']
+        del checkpoint['model']['cls.predictions.decoder.linear4.bias']
+
+
+        checkpoint['model']['cls.predictions.decoder.weight'] = torch.cat((checkpoint['model']['cls.predictions.decoder.weight'], torch.zeros(6, 1024)), dim = 0)
+        checkpoint['model']['cls.predictions.bias'] = torch.cat((checkpoint['model']['cls.predictions.bias'], torch.zeros(6)), dim = 0)
+
+        del checkpoint['model']['bert.embeddings.position_ids']
+
+        keys = list(checkpoint['model'].keys())[:]
+
+        for name in keys:
+            if '.intermediate.dense' in name:
+                checkpoint['model'][name.replace('intermediate.dense', 'intermediate.dense_act')] = checkpoint['model'][name]
+                del checkpoint['model'][name]
+
+            if 'pooler.dense' in name:
+                checkpoint['model'][name.replace('pooler.dense', 'pooler.dense_act')] = checkpoint['model'][name]
+                del checkpoint['model'][name]
+
+            if 'transform.dense' in name:
+                checkpoint['model'][name.replace('transform.dense', 'transform.dense_act')] = checkpoint['model'][name]
+                del checkpoint['model'][name]
+
+        model.load_state_dict(checkpoint['model'], strict=True)
         
         if args.phase2 and not args.init_checkpoint:
             global_step -= args.phase1_end_step
@@ -397,7 +440,7 @@ def prepare_model_and_optimizer(args, device):
 
     model.checkpoint_activations(args.checkpoint_activations)
 
-    if args.resume_from_checkpoint:
+    if False:
         if args.phase2 or args.init_checkpoint:
             keys = list(checkpoint['optimizer']['state'].keys())
             #Override hyperparameters from previous checkpoint
@@ -508,12 +551,6 @@ def main():
     # Prepare optimizer
     model, optimizer, lr_scheduler, checkpoint, global_step, criterion = prepare_model_and_optimizer(args, device)
 
-    if args.disable_weight_tying:
-        print ("WARNING!!!!!!! Disabling weight tying for this run")
-        print ("BEFORE ", model.cls.predictions.decoder.weight is model.bert.embeddings.word_embeddings.weight)
-        model.cls.predictions.decoder.weight = torch.nn.Parameter(model.cls.predictions.decoder.weight.clone().detach())
-        print ("AFTER ", model.cls.predictions.decoder.weight is model.bert.embeddings.word_embeddings.weight)
-
     if is_main_process():
         dllogger.log(step="PARAMETER", data={"SEED": args.seed})
 
@@ -526,7 +563,7 @@ def main():
             dllogger.log(step="PARAMETER", data={"batch_size_per_gpu": args.train_batch_size})
             dllogger.log(step="PARAMETER", data={"learning_rate": args.learning_rate})
 
-        model.train()
+        model.eval()
         most_recent_ckpts_paths = []
         average_loss = 0.0  # averaged loss every args.log_freq steps
         epoch = 0
@@ -535,12 +572,12 @@ def main():
         pool = ProcessPoolExecutor(1)
 
         # Note: We loop infinitely over epochs, termination is handled via iteration count
-        while True:
+        for i in range(0, 1):
             thread = None
             restored_data_loader = None
             if not args.resume_from_checkpoint or epoch > 0 or (args.phase2 and global_step < 1) or args.init_checkpoint:
                 files = [os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir) if
-                         os.path.isfile(os.path.join(args.input_dir, f)) and ('training' in f or 'train' in f)]
+                         os.path.isfile(os.path.join(args.input_dir, f)) and ('test' in f)]
                 files.sort()
                 num_files = len(files)
                 random.Random(args.seed + epoch).shuffle(files)
@@ -580,9 +617,15 @@ def main():
             if args.allreduce_post_accumulation:
                 overflow_buf = torch.cuda.IntTensor([0])
 
+            all_losses = []
+            all_mlm_losses = []
+            all_ns_losses = []
+            relevant_files = [250, 56, 162, 22, 240, 153]
             for f_id in range(f_start_id + 1 , len(files)):
+                if not f_id in relevant_files:
+                    continue
                 
-   
+                print (f"FILE ITER: {f_id} / {len(files)} ")
                 if get_world_size() > num_files:
                     data_file = files[(f_id*get_world_size()+get_rank() + remainder*f_id)%num_files]
                 else:
@@ -600,6 +643,10 @@ def main():
                     training_steps += 1
                     batch = [t.to(device) for t in batch]
                     input_ids, segment_ids, input_mask, masked_lm_labels, next_sentence_labels = batch
+                    model = model.eval()
+                    input_ids.requires_grad = False
+                    input_mask.requires_grad = False
+                    segment_ids.requires_grad=False
                     prediction_scores, seq_relationship_score = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
                     loss, mlm_loss, ns_loss = criterion(prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels)
                     if args.n_gpu > 1:
@@ -615,17 +662,19 @@ def main():
                             mlm_loss = mlm_loss.detach() / args.gradient_accumulation_steps
                             ns_loss = ns_loss.detach() / args.gradient_accumulation_steps
                             divisor = 1.0
-                    if args.fp16:
-                        with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
-                            scaled_loss.backward()
-                    else:
-                        loss.backward()
+                    #if args.fp16:
+                    #    with amp.scale_loss(loss, optimizer, delay_overflow_check=args.allreduce_post_accumulation) as scaled_loss:
+                    #        scaled_loss.backward()
+                    #else:
+                    #    loss.backward()
 
                     average_loss += loss.item()
-
-                    if training_steps % args.gradient_accumulation_steps == 0:
-                        lr_scheduler.step()  # learning rate warmup
-                        global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+                    all_losses.append(loss.item())
+                    all_mlm_losses.append(mlm_loss.item())
+                    all_ns_losses.append(ns_loss.item())
+                    #if training_steps % args.gradient_accumulation_steps == 0:
+                    #    lr_scheduler.step()  # learning rate warmup
+                    #    #global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
 
                     if global_step >= args.steps_this_run or timeout_sent:
                         train_time_raw = time.time() - raw_train_start
@@ -669,9 +718,6 @@ def main():
                                             'data_loader': None if global_step >= args.max_steps else train_dataloader}, output_save_file)
 
                                 most_recent_ckpts_paths.append(output_save_file)
-                                if len(most_recent_ckpts_paths) > 3:
-                                    ckpt_to_be_removed = most_recent_ckpts_paths.pop(0)
-                                    os.remove(ckpt_to_be_removed)
 
                         # Exiting the training due to hitting max steps, or being sent a 
                         # timeout from the cluster scheduler
@@ -688,6 +734,22 @@ def main():
 
             epoch += 1
 
+            if not os.path.exists(os.path.dirname(f"eval_results/{args.init_checkpoint}.txt")):
+                try:
+                    os.makedirs(os.path.dirname(f"eval_results/{args.init_checkpoint}.txt"))
+                except OSError as exc: # Guard against race condition
+                    if exc.errno != errno.EEXIST:
+                        raise
+
+            loss_file = open(f"eval_results/{args.init_checkpoint}.txt", "w")
+            loss_file.write(f"All Loss ({len(all_losses)}): {sum(all_losses) / len(all_losses)}\n")
+            loss_file.write(f"MLM Loss ({len(all_mlm_losses)}): {sum(all_mlm_losses) / len(all_mlm_losses)}\n")
+            loss_file.write(f"NS Loss ({len(all_ns_losses)}): {sum(all_ns_losses) / len(all_ns_losses)}\n")
+            loss_file.close()
+            
+            print (f"All losses ({len(all_losses)}): {sum(all_losses) / len(all_losses)}")
+
+            exit()
 
 if __name__ == "__main__":
 
